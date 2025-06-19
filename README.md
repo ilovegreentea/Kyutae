@@ -1,12 +1,21 @@
-Spatial Target Cell Microenvironment Analysis
-This R script provides a comprehensive workflow for analyzing the cellular microenvironment around Target cells in spatial transcriptomics data, leveraging the Seurat object framework. It involves identifying neighboring cells, calculating cell type proportions in the vicinity of Target cells, and subsequently clustering these Target cells based on their unique microenvironmental profiles. The results are then visualized to reveal distinct Target cell clusters and their spatial associations with other cell types.
+Spatial Cell Microenvironment Analysis with Seurat
+Unlocking the Secrets of Cellular Neighborhoods in Spatial Omics Data
+This repository presents a robust and user-friendly R script designed to dissect the intricate cellular microenvironments within spatial transcriptomics data. Leveraging the powerful Seurat framework, this tool empowers researchers to move beyond single-cell analysis and explore the critical spatial interactions that shape biological function and disease.
 
-Workflow Overview
-The script performs the following key steps:
+Our script focuses on identifying and characterizing the unique cellular neighborhoods surrounding a target cell population (e.g., T/NK cells, B cells, Macrophages). By quantifying the proportional composition of neighboring cell types, we can cluster these target cells based on their distinct spatial contexts, revealing novel biological insights.
 
-Package Loading & Data Preparation: Loads necessary R packages and prepares the Seurat object by adding spatial coordinates to its metadata.
-Neighbor Definition: Identifies neighboring cells around each Target cell within the same image based on spatial proximity.
-Cell Type Proportion Calculation: Quantifies the proportions of different cell types in the neighborhood of each Target cell.
-Target Cell Clustering: Applies K-means and Non-negative Matrix Factorization (NMF) to cluster Target cells based on their calculated neighborhood profiles.
-Result Integration & Saving: Integrates the clustering results back into the Seurat object's metadata and saves intermediate data.
-Visualization: Generates insightful plots to visualize the composition of each Target cell cluster and their distribution across different sample conditions.
+Key Features
+Customizable Target Cell Analysis: Easily define your cell of interest to investigate its specific microenvironment.
+Flexible Annotation Integration: Seamlessly integrate your existing cell type annotations.
+Spatial Proximity Modeling: Precisely define cell-cell interactions based on adjustable spatial distances.
+Advanced Clustering: Employ both K-means and Non-negative Matrix Factorization (NMF) to uncover hidden patterns in cellular neighborhoods.
+Comprehensive Visualization: Generate intuitive plots that illustrate cluster composition and distribution across experimental conditions.
+Reproducible Workflow: A clear, parameter-driven script ensures your analyses are consistent and shareable.
+How It Works: The Analytical Journey
+The script guides your data through a structured analytical pipeline:
+
+Data Ingestion & Preparation: Your Seurat object is loaded, and precise spatial coordinates are integrated into the metadata, forming the foundation for spatial analysis.
+Neighborhood Definition: We meticulously identify cells neighboring your target population within a user-defined spatial radius, capturing localized interactions.
+Proportional Profiling: For each target cell, the script quantifies the relative abundance of all neighboring cell types, creating a unique "spatial signature."
+Contextual Clustering: Target cells are then grouped using K-means and NMF based on these spatial signatures, revealing populations with distinct microenvironmental roles.
+Insightful Visualization: The results are transformed into clear, publication-ready plots that illuminate the specific cell type compositions of each cluster and their variations across different conditions (e.g., disease states, treatment responses).
