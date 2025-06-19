@@ -1,0 +1,262 @@
+# --- 1. User-Defined Parameters ---
+# IMPORTANT: Adjust these parameters to match your specific dataset and analysis goals.
+
+# 1.1. Path to your Seurat object RDS file
+seurat_object_path <- "enter you seurat object path"
+
+# 1.2. Name of the assay to use (e.g., "Xenium", "RNA", "SCT")
+assay_name <- "Xenium"
+
+# 1.3. Name of the target cell type for microenvironment analysis (e.g., "T/NK cell", "B cell", "Macrophage")
+target_cell_type_name <- "Enter your target cell type"
+
+# 1.4. Name of the metadata column containing annotated cell types (e.g., "SingleR_full", "predicted_labels")
+annotated_cell_type_column <- "Enter your cell type column"
+
+# 1.5. Maximum distance for defining neighbors (in spatial units, e.g., micrometers).
+# Cells within this radius will be considered neighbors. Adjust based on your data's scale.
+neighbor_distance_um <- 80
+
+# 1.6. Number of clusters for K-means and NMF clustering.
+# You may need to experiment with different values.
+num_clusters <- 5
+
+# 1.7. Name of the metadata column containing sample or response information (e.g., "Response", "patient_group")
+response_column_name <- "Response"
+
+# --- 2. Load Required Packages ---
+# These packages are essential for the script's functionality.
+# If any are not installed, use install.packages("package_name") in your R console.
+library(Seurat)          # For single-cell and spatial omics data analysis
+library(dplyr)           # For data manipulation and piping operations (%>%)
+library(SpatialExperiment) # For spatial transcriptomics data structures (though not directly used for object here, often related)
+library(SeuratObject)    # Core Seurat S4 object methods
+library(sp)              # For spatial data classes and methods
+library(spdep)           # For spatial dependence modeling, including neighbor finding (dnearneigh)
+library(STutility)       # Utility functions for spatial transcriptomics
+library(tidyr)           # For data tidying, including reshaping (pivot_longer)
+library(ggplot2)         # For creating high-quality data visualizations
+library(NMF)             # For Non-negative Matrix Factorization
+library(RColorBrewer)    # For color palettes in visualizations
+library(ggpubr)          # For publication-ready plots based on ggplot2
+
+# --- 3. Load Data and Initial Setup ---
+# Load the Seurat object from the specified path.
+Seurat <- readRDS(seurat_object_path)
+
+# Set options to increase the maximum allowed size for global variables in 'future' plans.
+# This helps prevent memory issues with large datasets.
+options(future.globals.maxSize = 80000 * 1024^2) # Set to 80GB
+
+# Set the default assay using the user-defined parameter.
+DefaultAssay(Seurat) <- assay_name
+
+# --- 4. Add Spatial Coordinates to Metadata ---
+# Extract spatial coordinates (centroids) from each image within the Seurat object.
+# These coordinates represent the center of each cell's boundary.
+message("Extracting spatial coordinates...")
+all_coords <- lapply(names(Seurat@images), function(img_name) {
+  coords <- Seurat@images[[img_name]]@boundaries$centroids@coords
+  coords_df <- as.data.frame(coords)
+  # Assign cell barcodes as row names for easy lookup.
+  rownames(coords_df) <- Seurat@images[[img_name]]$centroids@cells
+  coords_df
+})
+# Combine coordinates from all images into a single data frame.
+coords_df <- bind_rows(all_coords)
+
+# Add the combined coordinate data frame as metadata to the Seurat object.
+Seurat <- AddMetaData(Seurat, metadata = coords_df)
+message("Spatial coordinates added to metadata.")
+
+# --- 5. Define Cell Neighbors (Spatial Proximity Analysis) ---
+# Identify neighboring cells for each cell within its respective image.
+# The 'dnearneigh' function is used to find neighbors within a specified distance range.
+message("Defining cell neighbors...")
+neighbor_results <- list()
+for (img_name in names(Seurat@images)) {
+  message("Processing: ", img_name)
+  coords <- Seurat@images[[img_name]]@boundaries$centroids@coords
+  coords_df <- as.data.frame(coords)
+  rownames(coords_df) <- Seurat@images[[img_name]]$centroids@cells
+  coords_sp <- sp::SpatialPoints(coords_df) # Convert to SpatialPoints object
+  
+  # Find neighbors within the user-defined distance range.
+  neighbor_list <- dnearneigh(coords_sp, 0, neighbor_distance_um)
+  neighbor_results[[img_name]] <- neighbor_list
+}
+message("Neighbor definitions complete.")
+
+# --- 6. Calculate Neighboring Cell Type Proportions for Target Cells ---
+# Focus on the user-defined target cell type and quantify the proportions of different cell types
+# in their immediate neighborhood.
+message(paste0("Calculating neighboring cell type proportions for ", target_cell_type_name, " cells..."))
+target_cells <- rownames(Seurat@meta.data)[Seurat@meta.data[[annotated_cell_type_column]] == target_cell_type_name]
+all_cell_types <- unique(Seurat@meta.data[[annotated_cell_type_column]]) # List of all unique cell types
+
+# Initialize a matrix to store cell type proportions, with target cells as rows
+# and all unique cell types as columns.
+prop_matrix <- matrix(0, nrow = length(target_cells), ncol = length(all_cell_types))
+rownames(prop_matrix) <- target_cells
+colnames(prop_matrix) <- all_cell_types
+
+# Iterate through each image and each target cell to calculate neighbor proportions.
+for (img_name in names(neighbor_results)) {
+  neighbor_list <- neighbor_results[[img_name]]
+  cells <- Seurat@images[[img_name]]$centroids@cells
+  target_idx <- which(cells %in% target_cells) # Indices of target cells in the current image
+  
+  for (i in target_idx) {
+    neighbors <- neighbor_list[[i]] # Indices of neighbors for the current target cell
+    if (length(neighbors) > 0) { # Proceed only if neighbors exist
+      barcode <- cells[i] # Barcode of the current target cell
+      neighbor_barcodes <- cells[neighbors] # Barcodes of neighboring cells
+      
+      # Retrieve cell type labels for neighboring cells using the user-defined column.
+      neighbor_labels <- Seurat@meta.data[neighbor_barcodes, annotated_cell_type_column]
+      
+      # Calculate proportions of each cell type among the neighbors and store in prop_matrix.
+      tab <- prop.table(table(neighbor_labels))
+      prop_matrix[barcode, names(tab)] <- as.numeric(tab)
+    }
+  }
+}
+
+# Filter out target cells that had no neighbors (i.e., rows with all zeros).
+prop_matrix_filtered <- prop_matrix[rowSums(prop_matrix) > 0, ]
+message("Neighboring cell type proportion calculation complete.")
+
+# --- 7. Clustering: K-means and Non-negative Matrix Factorization (NMF) ---
+# Cluster the target cells based on their neighboring cell type proportions.
+# Set a seed for reproducibility of clustering results.
+message("Performing K-means and NMF clustering...")
+
+# K-means clustering using the user-defined number of clusters.
+set.seed(42) # For reproducibility
+km_res <- kmeans(prop_matrix_filtered, centers = num_clusters)
+
+# NMF clustering using the user-defined number of clusters.
+set.seed(42) # For reproducibility
+nmf_result <- nmf(prop_matrix_filtered, rank = num_clusters, method = "brunet", nrun = 10)
+nmf_basis <- basis(nmf_result) # Extract basis matrix from NMF result
+nmf_clusters <- apply(nmf_basis, 1, which.max) # Assign each cell to the cluster with the highest basis value
+message("Clustering complete.")
+
+# --- 8. Integrate Clustering Results into Seurat Object Metadata and Save ---
+# Add the K-means and NMF clustering results as new metadata columns to the Seurat object.
+Seurat$cluster_kmeans_env <- NA
+Seurat$cluster_kmeans_env[rownames(prop_matrix_filtered)] <- as.character(km_res$cluster)
+
+Seurat$cluster_nmf_env <- NA
+Seurat$cluster_nmf_env[rownames(prop_matrix_filtered)] <- as.character(nmf_clusters)
+
+# Define output file names based on the target cell type for clarity.
+output_meta_file <- paste0(gsub(" ", "_", tolower(target_cell_type_name)), "_cluster_meta_results.rds")
+output_matrix_file <- paste0(gsub(" ", "_", tolower(target_cell_type_name)), "_prop_matrix_filtered.rds")
+
+# Save the updated metadata and the filtered proportion matrix for future use.
+saveRDS(Seurat@meta.data, output_meta_file)
+message(paste0("Updated metadata saved to: ", output_meta_file))
+
+# Convert the filtered proportion matrix to a data frame and save.
+subset_matrix_df <- as.data.frame(prop_matrix_filtered)
+saveRDS(subset_matrix_df, output_matrix_file)
+message(paste0("Filtered proportion matrix saved to: ", output_matrix_file))
+
+# --- 9. Analyze and Visualize Cluster-specific Neighboring Cell Type Proportions ---
+# Calculate and visualize the mean proportions of neighboring cell types for each cluster.
+message("Generating cluster composition plots...")
+
+# Add cluster assignments to the subset_matrix_df.
+subset_matrix_df$cluster_kmeans <- Seurat$cluster_kmeans_env[rownames(subset_matrix_df)]
+subset_matrix_df$cluster_nmf <- Seurat$cluster_nmf_env[rownames(subset_matrix_df)]
+
+# Calculate mean cell type proportions for each K-means cluster.
+cluster_means_kmeans <- subset_matrix_df %>%
+  group_by(cluster_kmeans) %>%
+  summarise(across(where(is.numeric), mean))
+
+# Calculate mean cell type proportions for each NMF cluster.
+cluster_means_nmf <- subset_matrix_df %>%
+  group_by(cluster_nmf) %>%
+  summarise(across(where(is.numeric), mean))
+
+# Reshape data to 'long' format for ggplot2 visualization.
+cluster_means_kmeans_long <- pivot_longer(cluster_means_kmeans, -cluster_kmeans,
+                                          names_to = "cell_type", values_to = "mean_prop")
+cluster_means_nmf_long <- pivot_longer(cluster_means_nmf, -cluster_nmf,
+                                       names_to = "cell_type", values_to = "mean_prop")
+
+### Stacked Bar Plot of NMF Cluster Neighboring Cell Type Proportions
+# Visualizes the composition of each NMF cluster based on its neighboring cell types.
+ggplot(cluster_means_nmf_long, aes(x = factor(cluster_nmf), y = mean_prop, fill = cell_type)) +
+  geom_col(position = "stack") + # Stacked bar plot
+  labs(x = paste0("NMF Cluster (", target_cell_type_name, ")"), y = "Mean Cell Type Proportion", fill = "Cell Type",
+       title = paste0("NMF Cluster Composition for ", target_cell_type_name, " Microenvironment")) + # Axis and legend labels
+  theme_minimal(base_size = 14) + # Minimal theme with base font size
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5)) # Adjust x-axis text
+ggsave(paste0(gsub(" ", "_", tolower(target_cell_type_name)), "_nmf_cluster_stacked_barplot.pdf"), width = 10, height = 7)
+
+### Heatmap of NMF Cluster Neighboring Cell Type Proportions
+# Provides a heatmap representation of the proportional relationships between NMF clusters and cell types.
+ggplot(cluster_means_nmf_long, aes(x = factor(cluster_nmf), y = cell_type, fill = mean_prop)) +
+  geom_tile(color = "white") + # Tile plot (heatmap), with white borders
+  scale_fill_gradient(low = "white", high = "steelblue") + # Color gradient from white to steelblue
+  labs(x = paste0("NMF Cluster (", target_cell_type_name, ")"), y = "Cell Type", fill = "Proportion",
+       title = paste0("NMF Cluster Composition Heatmap for ", target_cell_type_name, " Microenvironment")) + # Axis and legend labels
+  theme_minimal(base_size = 14) # Minimal theme with base font size
+ggsave(paste0(gsub(" ", "_", tolower(target_cell_type_name)), "_nmf_cluster_heatmap.pdf"), width = 10, height = 7)
+message("Cluster composition plots saved.")
+
+# --- 10. Normalized Cell Count Visualization by Response and Cluster ---
+# Visualize the normalized distribution of target cell clusters across different user-defined response groups.
+message(paste0("Generating normalized cell count plot by ", response_column_name, " and cluster..."))
+
+# Select relevant metadata columns and remove rows with NA values for the chosen response column.
+# Ensure the response_column_name actually exists in the metadata.
+if (!response_column_name %in% colnames(Seurat@meta.data)) {
+  warning(paste0("Column '", response_column_name, "' not found in Seurat object metadata. Skipping response-based visualization."))
+} else {
+  df <- Seurat@meta.data %>%
+    select(cluster_nmf_env, sample_name, !!sym(response_column_name)) %>%
+    na.omit() # Omit NA values only from selected columns
+
+  # Calculate cell counts per Response group and NMF cluster.
+  cell_counts <- df %>%
+    group_by(!!sym(response_column_name), cluster_nmf_env) %>%
+    summarise(cell_count = n(), .groups = "drop")
+
+  # Calculate the number of unique samples per Response group.
+  sample_counts <- df %>%
+    group_by(!!sym(response_column_name)) %>%
+    summarise(sample_n = n_distinct(sample_name), .groups = "drop")
+
+  # Join counts and normalize cell counts by the number of samples in each response group.
+  normalized_counts <- cell_counts %>%
+    left_join(sample_counts, by = setNames(response_column_name, response_column_name)) %>% # Correct join by dynamic column name
+    mutate(count_per_sample = cell_count / sample_n)
+
+  # Create a 'group' variable using the response column name.
+  normalized_counts$group <- normalized_counts[[response_column_name]]
+
+  # Convert 'cluster_nmf_env' to a factor.
+  normalized_counts$target_cell_cluster <- factor(normalized_counts$cluster_nmf_env)
+
+  # Define a custom color palette for visualization.
+  set3_colors <- c(brewer.pal(n = 12, name = "Set3"),
+                   '#D2691E', '#B39DDB', '#FFAB91', '#4DB6AC', '#F48FB1', '#C5E1A5', '#FFD54F')
+
+  ### Stacked Bar Plot of Normalized Target Cell Counts
+  # Visualizes the normalized counts of target cell clusters, stacked by Response group.
+  ggplot(normalized_counts, aes(x = group, y = count_per_sample, fill = target_cell_cluster)) +
+    geom_bar(stat = "identity", position = "stack") + # Stacked bar plot
+    scale_fill_manual(values = set3_colors) + # Apply custom color palette
+    labs(x = response_column_name, y = "Normalized Cell Count per Sample",
+         title = paste0("Normalized ", target_cell_type_name, " Cluster Counts by ", response_column_name),
+         fill = paste0(target_cell_type_name, " Cluster")) + # Axis and legend labels
+    theme_minimal(base_size = 14) + # Minimal theme with base font size
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) # Rotate x-axis text for readability
+  ggsave(paste0(gsub(" ", "_", tolower(target_cell_type_name)), "_normalized_counts_by_", gsub(" ", "_", tolower(response_column_name)), ".pdf"), width = 10, height = 7)
+  message("Normalized cell count plot saved.")
+}
+message("Script execution complete.")
